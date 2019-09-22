@@ -1,0 +1,155 @@
+---
+title: Text Generation with LSTM - Last words
+author: Scott Lee
+date: '2019-09-22'
+slug: text-generation-with-lstm-last-words
+categories:
+  - R
+tags:
+  - Neural Networks
+---
+
+```{r setup, include=FALSE,eval = TRUE}
+knitr::opts_chunk$set(collapse = TRUE)
+library(keras)
+library(stringr)
+library(readr)
+```
+
+**Some Context**
+
+I noticed around a year ago while writing an email using Gmail that the application was suggesting how I should finish a sentence. A similar feature was added in LinkedIn not too while ago suggesting phrases to use on messages.
+
+This piqued my interest and I started looking into how this was done and came across this [amazing book by Francois Chollet and JJ Allaire](https://www.amazon.com/Deep-Learning-R-Francois-Chollet/dp/161729554X)  which goes from basic theory to advanced practical applications on deep learning using the Keras framework (with Tensorflow as the backend engine). 
+
+I came across a dataset on [Kaggle](https://www.kaggle.com/mykhe1097/last-words-of-death-row-inmates) which contains last words made by death row inmates and thought it would be interesting to see if I could apply LSTM to predict/generate coherent human-like words uttered by death row inmates if, for instance they didn't end up finishing their sentence. 
+
+There's a chapter called *Generative deep learning* in the book which goes through a workflow on text generation using Long Short-Term Memory (LSTM) layers which I will try to apply here. 
+
+**Workflow**
+
+* Preparing the data. Each of the statements are in individual rows. We need to have them collapsed into one record so that we can use it to generate the dataset that can fit into our LSTM model.
+
+```{r,eval = TRUE}
+text_dump <- read_csv("Texas Last Statement - CSV.csv",locale = readr::locale(encoding = "windows-1252")) 
+
+text_collapsed <- paste(text_dump$LastStatement,collapse=" ") 
+
+text <- str_to_lower(text_collapsed)
+```
+
+* We need a 3D array for the LSTM model, the first dimension being the number of snippets of words we have extracted from the entire single record above, the second dimension being the number of characters in the snippets (we will fix this number to 60) and the last dimension being the number of unique characters in our entire record - as per the book the dimensions are (sequences, maxlen, unique_characters). 
+
+* Just like the Naives Bayes Classifer that was covered in an earlier blog, we require categorical features (one-hot encoding is performed in the loop below). 
+
+```{r,eval = TRUE}
+maxlen <- 60 #this is the number of characters in each snippet
+
+step <- 3 #new snippets will be generated every 3 characters 
+
+text_indexes <- seq(1,nchar(text)-maxlen,by=step)
+sentences <-  str_sub(text,text_indexes,text_indexes+maxlen-1) #these are our snippets
+next_chars <-  str_sub(text,text_indexes+maxlen,text_indexes+maxlen) #our targets
+
+cat("Number of snippets: ",length(sentences),"\n")
+
+chars <- unique(sort(strsplit(text,"")[[1]])) #the following will form our third dimension
+cat("Unique characters:",length(chars),"\n")
+char_indices <- 1:length(chars)
+names(char_indices) <- chars
+
+x <- array(0L,dim=c(length(sentences),maxlen,length(chars))) #initiate the 3D array
+y <- array(0L,dim=c(length(sentences),length(chars))) #this array contains the corresponding targets
+
+for (i in 1:length(sentences)){ ###populate the arrays
+  sentence <- strsplit(sentences[[i]],"")[[1]]
+  for (t in 1:length(sentence)) {
+    char <- sentence[[t]]
+    x[i,t,char_indices[[char]]] <- 1
+  }
+  next_char <- next_chars[[i]]
+  y[i,char_indices[[next_char]]] <- 1
+}
+```
+
+* Build the network - a single-layer LSTM model is used along with a categorical optimiser to train the model. For an in-depth understanding of the model used here, please refer to the textbook which explains it very well.
+
+```{r,eval = TRUE}
+model <- keras_model_sequential() %>%
+  layer_lstm(units=128,input_shape = c(maxlen,length(chars))) %>%
+  layer_dense(units=length(chars),activation="softmax")
+
+optimizer <- optimizer_rmsprop(lr = 0.01)
+
+model %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = optimizer
+)
+```
+
+* Before feeding our dataset into our build model, we need to create a sampling function which will have as one of its parameter "temperature". Technical details can be found in the book but essentially it is a parameter that determines how random our character generation will be, higher temperature generating higher randomness in our character selection.
+
+```{r,eval = TRUE}
+sample_next_char <- function(preds,temperature = 1.0) {
+  preds <- as.numeric(preds)
+  preds <-  log(preds)/temperature
+  exp_preds <- exp(preds)
+  preds <- exp_preds/sum(exp_preds)
+  which.max(t(rmultinom(1,1,preds)))
+}
+```
+
+* Now it's time to generate those texts! Due to the limitation of my PC, I will set the training iteration to just 30 (epochs = 30). Ideally, we would want a much higher iteration count, say up to 60, to ensure that the model has mostly converged. I've added comments into the code to help understanding what's happening.  
+
+* You will notice that as the epoch count increases, the text starts to increase in coherency. Note also the effect of the temperature. A low temperature results in repetitive and predicable word snippets. With higher temperatures, the generated text becomes more obscure and loses structure, sometimes inventing completely new words. The middle ground (temperature: 0.5) is probably the most interest to us as it retains most of it's structure but isn't completely repetitive. 
+
+```{r,eval = TRUE}
+set.seed(1234)
+
+for (epoch in 1:30) {
+
+  model %>% fit(x,y,batch_size=128,epochs = 1) #fit our dataset to the model
+  
+  start_index <- sample(1:(nchar(text)-maxlen-1),1) #random indexing to generate a random snippet to use for generating text
+  seed_text <-  str_sub(text,start_index,start_index + maxlen - 1)
+  
+  if (epoch %in% c(1,5,10,20,30)){
+    cat("**--Generating with seed:",seed_text,"\n\n")
+  }
+  
+  for (temperature in c(0.2,0.5,1.0,1.2)) {
+    if (epoch %in% c(1,5,10,20,30)){
+      cat("--temperature:",temperature,"--epoch:",epoch,"\n")
+      cat(seed_text,"\n")
+    }
+    
+    generated_text <- seed_text
+    
+    for (i in 1:150) { #we generate 150 characters that gets appended to our randomly chosen snippet 
+      sampled <- array(0,dim=c(1,maxlen,length(chars)))
+      generated_chars <- strsplit(generated_text,"")[[1]]
+      for (t in 1:length(generated_chars)){
+        char <- generated_chars[[t]]
+        sampled[1,t,char_indices[[char]]] <- 1
+        
+      }
+      preds <- model %>% predict(sampled,verbose=0)
+      next_index <- sample_next_char(preds[1,],temperature) #this is where we use our sample function to determine our next character
+      next_char <- chars[[next_index]]
+      
+      generated_text <- paste0(generated_text,next_char)
+      generated_text <- substring(generated_text,2)
+      
+      if (epoch %in% c(1,5,10,20,30)){
+        cat(next_char)
+      }
+      
+    }
+    if (epoch %in% c(1,5,10,20,30)){
+      cat("\n\n")
+    }
+    
+  }
+}
+
+```
